@@ -10,9 +10,7 @@ void ext_main(void *r)
 	class_addmethod(c, (method)fl_adsr_float, "float", A_FLOAT, 0);
 	class_addmethod(c, (method)fl_adsr_int, "int", A_LONG, 0);
 	class_addmethod(c, (method)fl_adsr_bang, "bang", 0);
-
-	class_addmethod(c, (method)fl_adsr_dsr_list, "dsr", A_GIMME, 0);
-	class_addmethod(c, (method)fl_adsr_attack, "attack", A_GIMME, 0);
+	class_addmethod(c, (method)fl_adsr_list, "list", A_GIMME, 0);
 	class_addmethod(c, (method)fl_adsr_curvemode, "mode", A_GIMME, 0);
 
 	class_dspinit(c);
@@ -25,30 +23,40 @@ void *fl_adsr_new(t_symbol *s, short argc, t_atom *argv)
 {
 	t_fl_adsr *x = (t_fl_adsr *)object_alloc(fl_adsr_class);
 
+	inlet_new((t_object *)x, "list");
 	dsp_setup((t_pxobject *)x, 0);
 	x->m_outlet = outlet_new((t_object *)x, "signal");
 	x->obj.z_misc |= Z_NO_INPLACE;
 
 	x->play_task = PT_NONE;
 
-	x->samp_count_a = 0;
-	x->ms_attack = DFLT_MS_ATTACK;
-	x->curve_attack = DFLT_PROCCURVE;
-	x->samp_count_dsr = 0;
-	x->ms_dsr = DFLT_MS_DSR;
+	x->samp_count_att = 0;
+	x->samp_count_mid = 0;
+	x->samp_count_rel = 0;
+
+	x->ms_attack = 0;
+	x->samp_attack = 0;
+	x->ms_middle = 0;
+	x->samp_middle = 0;
+	x->ms_release = 0;
+	x->samp_release = 0;
 
 	x->curve_mode = CM_LINEAR;
+	//x->att_brkpts = DFLT_ATTBRKPTS;
+	//x->rel_brkpts = DFLT_RELBRKPTS;
 
 	x->fs = sys_getsr();
 
-	x->len_pts = DFLT_BRKPTS;
-	x->pts_curve = (fl_pt *)sysmem_newptr(MAX_BRKPTS * sizeof(fl_pt));
-	if (x->pts_curve == NULL) { object_error((t_object *)x, "out of memory: no space for curve"); return x; }
+	x->len_segs = DFLT_BRKPTS;
+	x->segs = (fl_seg *)sysmem_newptr(MAX_BRKPTS * sizeof(fl_seg));
+	if (x->segs == NULL) { object_error((t_object *)x, "out of memory: no space for curve"); return x; }
 	else {
 		for (long i = 0; i < MAX_BRKPTS; i++) {
-			x->pts_curve[i].y = 0.0;
-			x->pts_curve[i].dt = 0.0;
-			x->pts_curve[i].c = 0.5;
+			x->segs[i].dt = 0;
+			x->segs[i].yi = 0.0;
+			x->segs[i].yf = 0.0;
+			x->segs[i].c = 1.0;
+			x->segs[i].r = 1.0;
 		}
 	}
 
@@ -57,16 +65,29 @@ void *fl_adsr_new(t_symbol *s, short argc, t_atom *argv)
 	if (x->wavetable_new == NULL) { object_error((t_object *)x, "out of memory: no space for wavetable"); return x; }
 	else {
 		for (int i = 0; i < DFLT_TABLE_SIZE; i++) {
-			x->wavetable_new[i] = (DFLT_TABLE_SIZE - 1 - i) / (float)(DFLT_TABLE_SIZE - 1);
+			x->wavetable_new[i] = 0.0;
 		}
 	}
 	x->wavetable = (float *)sysmem_newptr(DFLT_TABLE_SIZE * sizeof(float));
 	if (x->wavetable == NULL) { object_error((t_object *)x, "out of memory: no space for wavetable"); return x; }
 	else{
 		for (int i = 0; i < DFLT_TABLE_SIZE; i++) {
-			x->wavetable[i] = (DFLT_TABLE_SIZE - 1 - i) / (float)(DFLT_TABLE_SIZE - 1);
+			x->wavetable[i] = 0.0;
 		}
 	}
+	x->table_init = 0;
+
+	x->table_att_size = x->table_size / 4;
+	//x->table_att_start = 0;
+	x->table_att_end = x->table_att_size - 1;
+
+	x->table_mid_size = x->table_size / 2;
+	x->table_mid_start = x->table_att_end + 1;
+	x->table_mid_end = x->table_mid_start + x->table_mid_size - 1;
+	
+	x->table_rel_size = x->table_size / 4;
+	x->table_rel_start = x->table_mid_end + 1;
+	x->table_rel_end = x->table_size - 1;
 
 	x->dirty = 0;
 
@@ -76,11 +97,15 @@ void *fl_adsr_new(t_symbol *s, short argc, t_atom *argv)
 void fl_adsr_int(t_fl_adsr *x, long n) 
 {	
 	if (n != n) { return; }
+	if (n < MIN_MS_ENVELOPE) { return; }
 	
-	long ms_envelope = MAX(MIN_MS_ENV, n);
-	long ms_attack = MIN(x->ms_attack, ms_envelope);
-	x->ms_dsr = MAX(MIN_MS_ENV, (ms_envelope - ms_attack));
+	long ms_attack = x->ms_attack;
+	long ms_release = x->ms_release;
+	long ms_envelope = n;
+	long ms_middle = MAX(0, (ms_envelope - ms_attack - ms_release));
 
+	x->samp_middle = (long)(ms_middle * x->fs * 0.001);
+	
 	fl_adsr_bang(x);
 }
 
@@ -91,122 +116,143 @@ void fl_adsr_float(t_fl_adsr *x, double f)
 
 void fl_adsr_bang(t_fl_adsr *x) 
 {
-	x->play_task = PT_NONE;
-
-	if (x->dirty) { fl_adsr_update_wavetable(x); }
-	x->play_task = PT_ATTACK;
-	x->samp_count_a = 0;
-	x->samp_count_dsr = 0;
+	if (!x->table_init) { return; }
 
 	x->play_task = PT_ATTACK;
+	x->samp_count_att = 0;
+	x->samp_count_mid = 0;
+	x->samp_count_rel = 0;
 }
 
-void fl_adsr_attack(t_fl_adsr *x, t_symbol *s, short argc, t_atom *argv)
-{
-	long ac = argc;
-	t_atom *ap = argv;
-	long attack;
-	float curve = DFLT_PROCCURVE;
-
-	if (ac < 1 && ac > 3) { object_error((t_object *)x,"attack: [1-2args] attack time, (curve)"); return; }
-	
-	if (atom_gettype(ap) != A_FLOAT && atom_gettype(ap) != A_LONG) { object_error((t_object *)x, "attack: argument must be a number"); return; }
-	attack = (long)atom_getlong(ap);
-
-	if(ac == 2){
-		if (atom_gettype(ap + 1) != A_FLOAT && atom_gettype(ap + 1) != A_LONG) { object_error((t_object *)x, "attack: argument must be a number"); return; }
-		curve = (float)atom_getfloat(ap + 1);
-	}
-
-	x->ms_attack = (long)MAX(MIN_MS_ENV, attack);
-	x->curve_attack = signorm2pow(curve);
-}
-
-void fl_adsr_dsr_list(t_fl_adsr *x, t_symbol *s, short argc, t_atom *argv)
-{
+void fl_adsr_list(t_fl_adsr *x, t_symbol *s, long argc, t_atom *argv) {
 	long ac = argc;
 	t_atom *ap = argv;
 
-	fl_pt *pts_c = x->pts_curve;
-
+	fl_seg *segs = x->segs;
 	short curve_mode = x->curve_mode;
 	short brkpt_size = curve_mode ? 3 : 2; //mode 0:linear (f,f) //mode 1:curve (f,f,f)
-	float value;
-	float domain;
-	//float range_i, range_f;
-	long n_brkpt = 0;
-	long j, k;
+	long att_brkpts = DFLT_ATTBRKPTS;	//x->att_brkpts;
+	long rel_brkpts = DFLT_RELBRKPTS;	//x->rel_brkpts;
+	long total_brkpts = ac / brkpt_size;
+	long min_arg;
+
+	long j = 0;
+	long k = 0;
+	long u = 0;
+	long ms_value = 0;
+	long domain = 0;
+	float curve = 0;
+	double fs = x->fs;
+
+	float r = 0.0;
+	long ms_accum = 0;
+	float x0 = 0.0;
+	float y_i = 0.0;
+	float y_f = 0.0;
+	short new_brkpt = 0;
+	long table_section = 0;
+	long table_past = 0;
+	long ms_section = 0;
+
+	long ms_attack = 0;
+	long ms_middle = 0;
+	long ms_release = 0;
+	long table_att_size = x->table_att_size;
+	long table_att_end = x->table_att_end;
+	long table_mid_start = x->table_mid_start;
+	long table_mid_size = x->table_mid_size;
+	long table_mid_end = x->table_mid_end;
+	long table_rel_start = x->table_rel_start;
+	long table_rel_size = x->table_rel_size;
+	long table_rel_end = x->table_rel_end;
 
 	long table_size = x->table_size;
 	float *wavetable_new = x->wavetable_new;
-	float x_i, y_i, y_f;
-	long segment;
-	float curve;
 
-	if (ac < 2) { return; }
-
-	n_brkpt = ac / brkpt_size;
-	if (n_brkpt > MAX_BRKPTS) { object_error((t_object *)x, "dsr: too many points"); return; }//debug
-
-	domain = 0.;
-	//range_i = range_f = (float)atom_getfloat(ap + 1);
-	for (long i = 0; i < ac; i++) {
-		
-		value = (float)atom_getfloat(ap + i);
-
-		j = i % brkpt_size;	//line-curve format (y,dx)(y,dx,c)
-		k = i / brkpt_size;
-		pts_c[k].c = DFLT_PROCCURVE;
-
-		if (j == 0) {
-			//range_i = MIN(range_i, value);
-			//range_f = MAX(range_f, value);
-
-			pts_c[k].y = value;
-		}
-		else if (j == 1) {
-			domain += value;
-
-			pts_c[k].dt = value;
-		}
-		else {
-			pts_c[k].c = signorm2pow(value);
-		}
+	if (curve_mode == CM_LINEAR) {
+		min_arg = 2 * (rel_brkpts + att_brkpts + curve_mode); //attack + release
+		if (ac < min_arg) { object_error((t_object *)x, "list: [>= %d args] %d attack + release breakpoints in line format", min_arg, att_brkpts); return; }
+		if (ac > 2 * MAX_BRKPTS) { object_error((t_object *)x, "list: [< %d args] breakpoints max", MAX_BRKPTS); return; }
 	}
-	x->len_pts = n_brkpt;
+	else {
+		min_arg = 3 * (rel_brkpts + att_brkpts);
+		if (ac < min_arg) { object_error((t_object *)x, "list: [>= %d args] %d attack + release breakpoints in curve format", min_arg, att_brkpts); return; }
+		if (ac > 3 * MAX_BRKPTS) { object_error((t_object *)x, "list: [< %d args] breakpoints max", MAX_BRKPTS); return; } 
+	}
+	
+	for (long i = 0; i < total_brkpts; i++) { //line-curve format (y,dx)(y,dx,c)
+		
+		//get atom data
+		j = i * brkpt_size;
+
+		if (i == 0) { segs[0].yi = 0; }
+		else{ segs[i].yi = (float)atom_getfloat(ap + j - brkpt_size); }
+		segs[i].yf = (float)atom_getfloat(ap + j);
+		
+		ms_value = (long)MAX(1, atom_getlong(ap + j + 1));
+		segs[i].dt = ms_value;
+
+		curve = (float)atom_getfloat(ap + j + 2);
+		segs[i].c = signorm2pow(curve);
+		
+		//attack, middle, release ms duration
+		if (i < att_brkpts) { ms_attack += (long)ms_value; }
+		if (i > (total_brkpts - 1) - rel_brkpts) { ms_release += (long)ms_value; }
+		domain += (long)ms_value;
+		
+	}
+	ms_attack = MAX(1, ms_attack);
+	ms_middle = MAX(1, domain - ms_attack - ms_release);
+	ms_release = MAX(1, ms_release);
+
+	//get ratios of each segment
+	for (long i = 0; i < total_brkpts; i++) {
+		if (i < att_brkpts) { segs[i].r = segs[i].dt / (float)ms_attack; }
+		else if (i > (total_brkpts - 1) - rel_brkpts) { segs[i].r = segs[i].dt / (float)ms_release; }
+		else{ segs[i].r = segs[i].dt / (float)ms_middle; }
+	}
 
 	k = 0;
-	j = 0;
-	x_i = 0.0;
-	y_i = 1.0;
-	y_f = pts_c[0].y;
-	segment = (long)(pts_c[0].dt / domain * (float)table_size);
-	curve = pts_c[0].c;
+	long accum = 0;
+	float xx = 0.0;
+	for (long i = 0; i < table_size; i++) { 
+		
+		//correct k
+		if (i == table_mid_start) { k = att_brkpts; accum = 0; }
+		else if (i == table_rel_start) { k = total_brkpts - rel_brkpts; accum = 0; }
 
-	for (long i = 0; i < table_size; i++) {	//k:puntos i:samps_table j:samps_segm 
-		if (j > segment) {
-			j = 0;
+		//get data
+		r = segs[k].r;
+		y_i = segs[k].yi;
+		y_f = segs[k].yf;
 
-			if (k < n_brkpt) { k++; }
+		if (i < table_mid_start) { x0 = accum++ / (table_att_size * r); }
+		else if (i < table_rel_start) { x0 = accum++ / (table_mid_size * r); }
+		else { x0 = accum++ / (table_rel_size * r); }
 
-			y_i = y_f;
-			segment = (long)(pts_c[k].dt / domain * (float)table_size);
-			y_f = pts_c[k].y;
-			curve = pts_c[k].c;
-		}
+		//f(x)
+		xx = MAX(0.f, MIN(1.f, x0));
+		if (!curve_mode) { wavetable_new[i] = xx * (y_f - y_i) + y_i; }
+		else { wavetable_new[i] = ((float)pow(xx, curve)) * (y_f - y_i) + y_i; }
 
-		x_i = (j / (float)MAX(segment, 1));
-		wavetable_new[i] = ((float)pow(x_i, curve)) * (y_f - y_i) + y_i;
-
-		j++;
+		//next k
+		if (x0 >= 1.0) { k = MIN(k++, total_brkpts - 1); accum = 0; }
 	}
 
-	x->dirty = 1;
-	if (x->play_task == PT_NONE) { fl_adsr_update_wavetable(x); }
+	x->len_segs = total_brkpts;
+	x->samp_attack = (long)(ms_attack * fs * 0.001);
+	x->samp_middle = (long)(ms_middle * fs * 0.001);
+	x->samp_release = (long)(ms_release * fs * 0.001);
+
+	fl_adsr_update_wavetable(x);
+
+	x->table_init = 1;
 }
 
 void fl_adsr_update_wavetable(t_fl_adsr *x) 
 {
+	x->dirty = 1;
+
 	long table_size = x->table_size;
 	float *wavetable_new = x->wavetable_new;
 	float *wavetable = x->wavetable;
@@ -253,17 +299,23 @@ void fl_adsr_free(t_fl_adsr *x)
 {
 	dsp_free((t_pxobject *)x);
 
-	sysmem_freeptr(x->pts_curve);
+	sysmem_freeptr(x->segs);
 	sysmem_freeptr(x->wavetable_new);
 	sysmem_freeptr(x->wavetable);
 }
 
 void fl_adsr_dsp64(t_fl_adsr *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags)
 {
-	if (x->fs != samplerate) {
-		x->fs = samplerate;
+	double old_fs = x->fs;
+	double fs = samplerate;
+	double fs_rat = fs / old_fs;
 
-		//x->increment = (float)(x->table_size / x->fs);
+	if (x->fs != fs) {
+		
+		x->fs = fs;
+		x->samp_count_att = (long)(x->samp_count_att * fs_rat);
+		x->samp_count_mid = (long)(x->samp_count_mid * fs_rat);
+		x->samp_count_rel = (long)(x->samp_count_rel * fs_rat);
 	}
 
 	object_method(dsp64, gensym("dsp_add64"), x, fl_adsr_perform64, 0, NULL);	/* attach the object to the DSP chain */
@@ -277,18 +329,29 @@ void fl_adsr_perform64(t_fl_adsr *x, t_object *dsp64, double **inputs, long numi
 
 	float fs = (float)x->fs;
 
-	long samp_count_a = x->samp_count_a;
-	long samp_attack = (long)(x->ms_attack * fs * 0.001);
-	float curve_attack = x->curve_attack;
-	long samp_dsr = (long)(x->ms_dsr * fs * 0.001);
-	long samp_count_dsr = x->samp_count_dsr;
+	long samp_count_att = x->samp_count_att;
+	long samp_count_mid = x->samp_count_mid;
+	long samp_count_rel = x->samp_count_rel;
 
-	float *wavetable = x->wavetable;
-	long max_index = x->table_size - 1;
+	long samp_attack = x->samp_attack;
+	long samp_middle = x->samp_middle;
+	long samp_release = x->samp_release;
+
+	float *wavetable;
+	if(x->dirty){wavetable = x->wavetable_new;}
+	else { wavetable = x->wavetable; }
 	
-	double env_value, val1, val2;;
-	float att_norm;
-	float dsr_norm;
+	long table_att_size = x->table_att_size;
+	long table_att_end = x->table_att_end;
+	long table_mid_start = x->table_mid_start;
+	long table_mid_size = x->table_mid_size;
+	long table_mid_end = x->table_mid_end;
+	long table_rel_start = x->table_rel_start;
+	long table_rel_size = x->table_rel_size;
+	long table_rel_end = x->table_rel_end;
+
+	double env_value, val1, val2;
+	double att_norm, mid_norm, rel_norm;
 	double findex, interp;
 	long index;
 
@@ -297,45 +360,66 @@ void fl_adsr_perform64(t_fl_adsr *x, t_object *dsp64, double **inputs, long numi
 		env_value = 0.0;
 
 		if (x->play_task == PT_ATTACK) {
-			if (samp_count_a >= samp_attack) {
-				x->play_task = PT_DSR;
-				env_value = 1.0;
-			}
-			else {
-				att_norm = (float)samp_count_a / (float)samp_attack;
-				env_value = (float)pow(att_norm, curve_attack);
-			}
 			
-			samp_count_a++;
-		}
-		else if (x->play_task == PT_DSR) {
-			if (samp_count_dsr > samp_dsr) {
-				x->play_task = PT_NONE;
-				env_value = 0.0;
+			if (samp_count_att < samp_attack) {
+				att_norm = (double)(samp_count_att++) / (double)samp_attack;
 			}
 			else {
-				dsr_norm = samp_count_dsr / (float)samp_dsr;
-				findex = (double)max_index * dsr_norm;
-				index = (long)floor(findex);
-				interp = findex - index;
+				att_norm = 1.0;
+				x->play_task = PT_MIDDLE;
+			}
+			findex = (double)(table_att_size * att_norm);
+			index = (long)floor(findex);
+			interp = findex - index;
+			val1 = wavetable[index];
+			index = MIN(index + 1, table_att_end);
+			val2 = wavetable[index];
+			env_value = val1 + interp * (val2 - val1); // v2 * interp + v1 * (1-interp)
+		}
+		else if (x->play_task == PT_MIDDLE) {
 
-				val1 = wavetable[index];
-				index = MIN(index + 1, max_index);
-				val2 = wavetable[index];
-				env_value = val1 + interp * (val2 - val1); /*v2 * interp + v1 * (1-interp)*/
+			if (samp_count_mid < samp_middle) {
+				mid_norm = (double)(samp_count_mid++) / (double)samp_middle;
 			}
-			
-			samp_count_dsr++;
+			else {
+				mid_norm = 1.0;
+				x->play_task = PT_RELEASE;
+			}
+			findex = (double)(table_mid_start + table_mid_size * mid_norm);
+			index = (long)floor(findex);
+			interp = findex - index;
+			val1 = wavetable[index];
+			index = MIN(index + 1, table_mid_end);
+			val2 = wavetable[index];
+			env_value = val1 + interp * (val2 - val1);
 		}
+		else if (x->play_task == PT_RELEASE) {
+			if (samp_count_rel < samp_release) {
+				rel_norm = (double)(samp_count_rel++) / (double)samp_release;
+			}
+			else {
+				rel_norm = 1.0;
+				x->play_task = PT_NONE;
+			}
+			findex = (double)(table_rel_start + table_rel_size * rel_norm);
+			index = (long)floor(findex);
+			interp = findex - index;
+			val1 = wavetable[index];
+			index = MIN(index + 1, table_rel_end);
+			val2 = wavetable[index];
+			env_value = val1 + interp * (val2 - val1);
+		}
+		//else { env_value = 0.0; } //PT_NONE
 		
 		*out_env++ = env_value;
 	}
 
-	x->samp_count_a = samp_count_a;
-	x->samp_count_dsr = samp_count_dsr;
+	x->samp_count_att = samp_count_att;
+	x->samp_count_mid = samp_count_mid;
+	x->samp_count_rel = samp_count_rel;
 }
 
-float signorm2pow(float signorm_curve) {
+float signorm2pow(float signorm_curve) { //(- 1, 1) -> (0, +inf)
 
 	float value = (float)MIN(INCURVE_MAX, MAX(INCURVE_MIN, signorm_curve));
 	if (value > 0.0f) {
