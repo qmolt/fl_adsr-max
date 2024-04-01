@@ -105,7 +105,7 @@ void fl_adsr_int(t_fl_adsr *x, long n)
 	long ms_middle = MAX(0, (ms_envelope - ms_attack - ms_release));
 
 	x->samp_middle = (long)(ms_middle * x->fs * 0.001);
-	
+
 	fl_adsr_bang(x);
 }
 
@@ -240,6 +240,9 @@ void fl_adsr_list(t_fl_adsr *x, t_symbol *s, long argc, t_atom *argv) {
 	}
 
 	x->len_segs = total_brkpts;
+	x->ms_attack = ms_attack;
+	x->ms_middle = ms_middle;
+	x->ms_release = ms_release;
 	x->samp_attack = (long)(ms_attack * fs * 0.001);
 	x->samp_middle = (long)(ms_middle * fs * 0.001);
 	x->samp_release = (long)(ms_release * fs * 0.001);
@@ -283,14 +286,13 @@ void fl_adsr_assist(t_fl_adsr *x, void *b, long msg, long arg, char *dst)
 {
 	if (msg == ASSIST_INLET) {
 		switch (arg) {
-		case I_INPUT: sprintf(dst, "(bang/float) start envelope");
-			break;
+		case I_INPUT: sprintf(dst, "(bang/float) start envelope"); break;
+		case I_LIST: sprintf(dst, "(list) envelope (line format)"); break;
 		}
 	}
 	else if (msg == ASSIST_OUTLET) {
 		switch (arg) {
-		case O_OUTPUT: sprintf(dst, "(sig~) Envelope");
-			break;
+		case O_OUTPUT: sprintf(dst, "(sig~) Envelope"); break;
 		}
 	}
 }

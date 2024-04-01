@@ -76,7 +76,7 @@ typedef struct _fl_adsr {
 
 } t_fl_adsr;
 
-enum INLETS { I_INPUT, NUM_INLETS };
+enum INLETS { I_INPUT, I_LIST, NUM_INLETS };
 enum OUTLETS { O_OUTPUT, NUM_OUTLETS };
 
 static t_class *fl_adsr_class;
